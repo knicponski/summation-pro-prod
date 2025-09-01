@@ -1,0 +1,626 @@
+Summation Pro — Pure?Azure LLM Summarization Stack (Grounded + Bing Grounding Toggle)
+This package is a Copilot?ready blueprint to stand up a pure?Azure system that ingests large deposition transcripts (Word/PDF), chunks/indexes them, grounds a GPT?4 class model on both the transcript and your internal guidelines, and produces the five Summation Pro tiers (Partner, Associate, Paralegal, Client, Insurance).
+Governance & style are enforced from your uploaded guidelines — Deposition_summary_guide.docx (tier definitions) and How to Summarize a Deposition Examp.txt (process & essential requirements).
+1) Architecture (pure Azure)
+* Frontend: Azure Static Web Apps (React + TypeScript) with Entra ID auth.
+* APIs: Azure Functions (HTTP) — create job, status, results, admin uploads.
+* Async: Azure Service Bus queue ? Azure Container Apps Jobs for long?running work (extract ? chunk ? embed ? index ? summarize ? render).
+* Storage: Azure Blob (incoming/work/results/guides).
+* Extraction: Azure AI Document Intelligence (Read v4) for DOCX/PDF text.
+* Retrieval: Azure AI Search (hybrid = keyword + vector) with two indices: `guidelines`, `transcripts`.
+* Generation: Azure OpenAI (GPT?4?class) + optional Grounding with Bing (Agent tool) for generic background only (never to override transcript facts).
+* Safety: Azure AI Content Safety (Prompt Shields + moderation).
+* Config & Secrets: Azure App Configuration + Azure Key Vault + Managed Identity.
+* Observability: Application Insights + Log Analytics (PII?redacted prompts).
+2) Storage layout & indices
+Blob containers:
+* incoming/
+* work/
+* results/{jobId}/
+* guides/
+Azure AI Search indices:
+* guidelines: id, title, tier(partner|associate|paralegal|client|insurance|general), text, vector
+* transcripts: id, jobId, chunkText, page, lineStart, lineEnd, speaker, section, vector
+3) Infrastructure as Code (Bicep) — minimal scaffolds
+Place these under /infra and deploy with Azure CLI (`az deployment sub create` or `az deployment group create`).
+infra/main.bicep
+
+param location string = resourceGroup().location
+param namePrefix string = 'sumpro'
+
+module stg './storage.bicep' = {
+  name: 'stg'
+  params: { namePrefix: namePrefix }
+}
+
+module sb './servicebus.bicep' = {
+  name: 'sb'
+  params: { namePrefix: namePrefix }
+}
+
+module aiSearch './search.bicep' = {
+  name: 'aisearch'
+  params: { namePrefix: namePrefix }
+}
+
+module appcfg './appconfig.bicep' = {
+  name: 'appcfg'
+  params: { namePrefix: namePrefix }
+}
+
+module kv './keyvault.bicep' = {
+  name: 'kv'
+  params: { namePrefix: namePrefix }
+}
+
+module insights './insights.bicep' = {
+  name: 'insights'
+  params: { namePrefix: namePrefix }
+}
+
+module caJob './containerapps-job.bicep' = {
+  name: 'cajob'
+  params: { namePrefix: namePrefix }
+}
+infra/storage.bicep
+
+param namePrefix string
+
+resource stg 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: '${namePrefix}stg${uniqueString(resourceGroup().id)}'
+  location: resourceGroup().location
+  sku: { name: 'Standard_LRS' }
+  kind: 'StorageV2'
+  properties: {
+    allowBlobPublicAccess: false
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
+resource contIncoming 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-01-01' = {
+  parent: stg::default
+  name: 'incoming'
+  properties: { publicAccess: 'None' }
+}
+
+resource contGuides 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-01-01' = {
+  parent: stg::default
+  name: 'guides'
+  properties: { publicAccess: 'None' }
+}
+
+resource contWork 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-01-01' = {
+  parent: stg::default
+  name: 'work'
+  properties: { publicAccess: 'None' }
+}
+
+resource contResults 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-01-01' = {
+  parent: stg::default
+  name: 'results'
+  properties: { publicAccess: 'None' }
+}
+
+output storageAccountName string = stg.name
+infra/servicebus.bicep
+
+param namePrefix string
+
+resource ns 'Microsoft.ServiceBus/Namespaces@2022-10-01-preview' = {
+  name: '${namePrefix}-sbns'
+  location: resourceGroup().location
+  sku: { name: 'Standard', tier: 'Standard' }
+}
+
+resource q 'Microsoft.ServiceBus/Namespaces/Queues@2022-10-01-preview' = {
+  name: '${ns.name}/summation-jobs'
+  properties: {
+    maxDeliveryCount: 10
+    lockDuration: 'PT5M'
+    enablePartitioning: true
+  }
+}
+
+output serviceBusNamespace string = ns.name
+output jobsQueueName string = q.name
+infra/search.bicep (service shell; create indices in code)
+
+param namePrefix string
+
+resource ais 'Microsoft.Search/searchServices@2023-11-01' = {
+  name: '${namePrefix}-search'
+  location: resourceGroup().location
+  sku: { name: 'standard' }
+  properties: {
+    hostingMode: 'default'
+    networkRuleSet: { ipRules: [] }
+  }
+}
+
+output searchServiceName string = ais.name
+infra/appconfig.bicep
+
+param namePrefix string
+resource cfg 'Microsoft.AppConfiguration/configurationStores@2022-05-01' = {
+  name: '${namePrefix}-cfg'
+  location: resourceGroup().location
+  sku: { name: 'Standard' }
+}
+output appConfigName string = cfg.name
+infra/keyvault.bicep (skeleton)
+
+param namePrefix string
+resource kv 'Microsoft.KeyVault/vaults@2023-02-01' = {
+  name: '${namePrefix}-kv'
+  location: resourceGroup().location
+  properties: {
+    tenantId: subscription().tenantId
+    sku: { family: 'A', name: 'standard' }
+    enabledForTemplateDeployment: true
+  }
+}
+output keyVaultName string = kv.name
+infra/containerapps-job.bicep (skeleton)
+
+param namePrefix string
+param containerImage string = 'ghcr.io/your-org/summation-worker:latest'
+
+resource env 'Microsoft.App/managedEnvironments@2023-05-01' = {
+  name: '${namePrefix}-caenv'
+  location: resourceGroup().location
+}
+
+resource job 'Microsoft.App/jobs@2023-05-01' = {
+  name: '${namePrefix}-summation-job'
+  location: resourceGroup().location
+  properties: {
+    environmentId: env.id
+    configuration: {
+      triggerType: 'Event'
+      replicaRetryLimit: 3
+      replicaTimeout: 3600
+      manualTriggerConfig: null
+      eventTriggerConfig: {
+        scale: {
+          minExecutions: 0
+          maxExecutions: 10
+          rules: [
+            {
+              name: 'sb-queue-rule'
+              custom: {
+                type: 'azure-servicebus'
+                metadata: {
+                  namespace: '<serviceBusNamespace>'
+                  queueName: 'summation-jobs'
+                  messageCount: '5'
+                }
+                auth: [{
+                  secretRef: 'sb-connection'
+                }]
+              }
+            }
+          ]
+        }
+        parallelism: 1
+      }
+      secrets: [
+        { name: 'sb-connection', value: '<SB_CONNECTION_STRING>' }
+      ]
+    }
+    template: {
+      containers: [{
+        image: containerImage
+        name: 'worker'
+        env: [
+          { name: 'AZURE_STORAGE_ACCOUNT', value: '<storage name>' },
+          { name: 'AZURE_SEARCH_SERVICE', value: '<search name>' },
+          { name: 'APP_CONFIG_NAME', value: '<appconfig name>' }
+        ]
+      }]
+    }
+  }
+}
+4) Azure Functions (Node/TypeScript) — /api
+Create these under /api. Use Entra ID (Easy Auth) and Managed Identity where possible.
+api/shared/azure.ts
+
+import { DefaultAzureCredential } from "@azure/identity";
+import { BlobServiceClient, StorageSharedKeyCredential, generateBlobSASQueryParameters, BlobSASPermissions, SASProtocol } from "@azure/storage-blob";
+import { ServiceBusClient } from "@azure/service-bus";
+
+export const cred = new DefaultAzureCredential();
+export const blob = (accountUrl: string) => new BlobServiceClient(accountUrl, cred);
+export const sbClient = (conn: string) => new ServiceBusClient(conn);
+
+export function makeWriteSasForBlob(containerUrl: string, blobName: string, accountName: string, accountKey: string) {
+  const sharedKey = new StorageSharedKeyCredential(accountName, accountKey);
+  const expiresOn = new Date(Date.now() + 15 * 60 * 1000);
+  const sas = generateBlobSASQueryParameters({
+    containerName: containerUrl.split('/').pop()!,
+    blobName,
+    expiresOn,
+    permissions: BlobSASPermissions.parse("cw"), // create+write
+    protocol: SASProtocol.Https
+  }, sharedKey).toString();
+  return `${containerUrl}/${blobName}?${sas}`;
+}
+api/CreateSas/index.ts
+
+import { AzureFunction, Context, HttpRequest } from "@azure/functions";
+import { makeWriteSasForBlob } from "../shared/azure";
+
+const httpTrigger: AzureFunction = async (context: Context, req: HttpRequest) => {
+  // DEV ONLY: read from env. PROD: read from Key Vault via Managed Identity.
+  const accountName = process.env.STORAGE_ACCOUNT_NAME!;
+  const accountKey = process.env.STORAGE_ACCOUNT_KEY!;
+  const containerUrl = process.env.INCOMING_CONTAINER_URL!; // https://<acct>.blob.core.windows.net/incoming
+  const blobName = req.query.name || `upload-${Date.now()}.docx`;
+  const sasUrl = makeWriteSasForBlob(containerUrl, blobName, accountName, accountKey);
+  context.res = { status: 200, body: { uploadUrl: sasUrl, blobUrl: sasUrl.split('?')[0] } };
+};
+export default httpTrigger;
+api/CreateJob/index.ts
+
+import { AzureFunction, Context, HttpRequest } from "@azure/functions";
+import { ServiceBusClient } from "@azure/service-bus";
+import { randomUUID } from "crypto";
+
+const httpTrigger: AzureFunction = async (context: Context, req: HttpRequest) => {
+  const { blobUrl, tiers, useBing } = req.body || {};
+  const jobId = randomUUID();
+  const sb = new ServiceBusClient(process.env.SB_CONNECTION!);
+  const sender = sb.createSender(process.env.JOBS_QUEUE || "summation-jobs");
+  await sender.sendMessages({ body: { jobId, blobUrl, tiers, useBing } });
+  await sender.close(); await sb.close();
+  context.res = { status: 200, body: { jobId } };
+};
+export default httpTrigger;
+api/GetJob/index.ts
+
+import { AzureFunction, Context, HttpRequest } from "@azure/functions";
+import { TableClient, AzureSASCredential } from "@azure/data-tables";
+
+const httpTrigger: AzureFunction = async (context: Context, req: HttpRequest) => {
+  const jobId = context.bindingData.jobId;
+  const tableUrl = process.env.TABLE_SAS_URL!; // SAS to table 'jobs' (dev) or use Managed Identity in prod.
+  const client = new TableClient(tableUrl, "jobs", new AzureSASCredential(process.env.TABLE_SAS!));
+  const entity = await client.getEntity("job", jobId).catch(() => null);
+  context.res = { status: 200, body: entity || { partitionKey: "job", rowKey: jobId, status: "Unknown" } };
+};
+export default httpTrigger;
+api/GetResult/index.ts
+
+import { AzureFunction, Context, HttpRequest } from "@azure/functions";
+import { BlobServiceClient } from "@azure/storage-blob";
+import { DefaultAzureCredential } from "@azure/identity";
+
+const httpTrigger: AzureFunction = async (context: Context, req: HttpRequest) => {
+  const jobId = context.bindingData.jobId;
+  const file = req.query.file || "summary.docx";
+  const accountUrl = process.env.STORAGE_ACCOUNT_URL!; // https://<acct>.blob.core.windows.net
+  const bs = new BlobServiceClient(accountUrl, new DefaultAzureCredential());
+  const cont = bs.getContainerClient("results");
+  const blob = cont.getBlobClient(`${jobId}/${file}`);
+  const exists = await blob.exists();
+  if (!exists) { context.res = { status: 404, body: "Not found" }; return; }
+  const sas = (await blob.generateSasUrl({ expiresOn: new Date(Date.now()+10*60*1000), permissions: "r" } as any)); // using preview helpers or prebuilt SAS
+  context.res = { status: 200, body: { downloadUrl: sas } };
+};
+export default httpTrigger;
+api/AdminUploadGuideline/index.ts
+
+import { AzureFunction, Context, HttpRequest } from "@azure/functions";
+import { BlobServiceClient } from "@azure/storage-blob";
+import { DefaultAzureCredential } from "@azure/identity";
+
+const httpTrigger: AzureFunction = async (context: Context, req: HttpRequest) => {
+  const accountUrl = process.env.STORAGE_ACCOUNT_URL!;
+  const bs = new BlobServiceClient(accountUrl, new DefaultAzureCredential());
+  const cont = bs.getContainerClient("guides");
+  const name = req.query.name || `guideline-${Date.now()}.docx`;
+  const body = req.body as Buffer;
+  const block = cont.getBlockBlobClient(name);
+  await block.upload(body, body.length, { blobHTTPHeaders: { blobContentType: req.headers["content-type"] || "application/octet-stream" } });
+  context.res = { status: 200, body: { ok: true, name } };
+};
+export default httpTrigger;
+5) Worker (Python) — Container Apps Job
+Install packages: azure-identity, azure-storage-blob, azure-ai-formrecognizer, azure-search-documents, openai (Azure), azure-servicebus, python-docx.
+worker/main.py
+
+import os, json, time
+from azure.identity import DefaultAzureCredential
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+from extract_text import extract_doc
+from chunk import chunk_transcript
+from embed import ensure_guidelines_indexed, embed_and_index_chunks, search_topk
+from summarize import summarize_tiers
+from render_docx import render_docx
+from status import save_status
+
+JOB_QUEUE = os.getenv("JOBS_QUEUE", "summation-jobs")
+
+def main():
+  cred = DefaultAzureCredential()
+  sb = ServiceBusClient.from_connection_string(os.environ["SB_CONNECTION"])
+  with sb:
+    receiver = sb.get_queue_receiver(queue_name=JOB_QUEUE)
+    for msg in receiver:
+      body = json.loads(str(msg))
+      jobId = body["jobId"]; blobUrl = body["blobUrl"]; tiers = body.get("tiers") or ["partner","associate","paralegal","client","insurance"]
+      useBing = bool(body.get("useBing", False))
+      save_status(jobId, "Running", {})
+      text, pages = extract_doc(blobUrl)
+      chunks = chunk_transcript(text, pages)
+      embed_and_index_chunks(chunks, jobId)
+      ensure_guidelines_indexed()
+      outputs = summarize_tiers(jobId, tiers, use_bing=useBing)
+      docx_url = render_docx(jobId, outputs)
+      save_status(jobId, "Completed", {"docx": docx_url})
+      receiver.complete_message(msg)
+
+if __name__ == "__main__":
+  main()
+worker/extract_text.py
+
+import os
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
+
+def extract_doc(blob_sas_url: str):
+  client = DocumentAnalysisClient(
+    endpoint=os.environ["DOCINT_ENDPOINT"],
+    credential=AzureKeyCredential(os.environ["DOCINT_KEY"])
+  )
+  poller = client.begin_analyze_document_from_url('prebuilt-read', blob_sas_url)
+  result = poller.result()
+  pages = []
+  text = []
+  for page in result.pages:
+    pages.append({"pageNumber": page.page_number})
+  for content in result.content.splitlines():
+    text.append(content)
+  return "
+".join(text), pages
+worker/chunk.py
+
+def chunk_transcript(text: str, pages):
+  # naive chunker; Copilot can improve overlap/speaker awareness
+  lines = text.splitlines()
+  chunks = []
+  buf = []
+  max_lines = 80
+  page = 1
+  for i, ln in enumerate(lines, start=1):
+    buf.append(ln)
+    if len(buf) >= max_lines:
+      chunks.append({"text": "\n".join(buf), "page": page, "lineStart": i-len(buf)+1, "lineEnd": i})
+      buf = []
+  if buf:
+    chunks.append({"text": "\n".join(buf), "page": page, "lineStart": 1, "lineEnd": len(lines)})
+  return chunks
+worker/embed.py
+
+import os, json
+from azure.identity import DefaultAzureCredential
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import SimpleField, SearchIndex, SearchFieldDataType, VectorSearch, HnswAlgorithmConfiguration, SearchField, VectorSearchProfile, VectorSearchAlgorithmConfiguration
+from openai import AzureOpenAI
+
+def _embed_texts(texts):
+  client = AzureOpenAI(
+    api_key=os.environ["AZURE_OPENAI_KEY"],
+    api_version=os.environ.get("AZURE_OPENAI_API_VERSION","2024-02-01"),
+    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"]
+  )
+  resp = client.embeddings.create(input=texts, model=os.environ.get("EMBED_MODEL","text-embedding-3-large"))
+  return [d.embedding for d in resp.data]
+
+def ensure_guidelines_indexed():
+  # TODO: scan guides/ and index into 'guidelines' once; Copilot to complete
+  pass
+
+def embed_and_index_chunks(chunks, jobId):
+  # Create or connect to 'transcripts' index and upload vectors
+  # Copilot will flesh out schema & batching
+  pass
+
+def search_topk(index_name: str, query: str, k=8):
+  # hybrid search glue — left to Copilot
+  return []
+worker/summarize.py
+
+import os, json
+from openai import AzureOpenAI
+
+GLOBAL_SYSTEM = """You are producing a Deposition Transcript Summary (Summation Pro).
+Follow tier rules and essential requirements. Never invent facts. Cite page:line for factual bullets.
+Tiers: Partner(<=1p), Associate(<=3p), Paralegal(<=10p), Client(1p plain English), Insurance(<=3p with outlook)."""
+
+def _load_directives():
+  # Pull from App Configuration; stub for Copilot to complete
+  return {}
+
+def _retrieve_guideline_snippets(tier: str):
+  # Query 'guidelines' index for: tier rules + process essentials
+  return []
+
+def _retrieve_transcript_evidence(jobId: str, topic: str):
+  # Query 'transcripts' index; stub
+  return []
+
+def summarize_tiers(jobId: str, tiers, use_bing: bool=False):
+  client = AzureOpenAI(
+    api_key=os.environ["AZURE_OPENAI_KEY"],
+    api_version=os.environ.get("AZURE_OPENAI_API_VERSION","2024-02-01"),
+    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"]
+  )
+  out = {}
+  for tier in tiers:
+    rules = _retrieve_guideline_snippets(tier)
+    context = _retrieve_transcript_evidence(jobId, "all")
+    messages = [
+      {"role":"system","content": GLOBAL_SYSTEM},
+      {"role":"user","content": f"Tier: {tier}. Rules:\n{rules}\nEvidence:\n{context}\nReturn JSON with sections[{ '{' }title, bullets[], cites[] { '}' }]."}
+    ]
+    resp = client.chat.completions.create(
+      model=os.environ.get("CHAT_MODEL","gpt-4o"),
+      messages=messages,
+      temperature=0.2
+    )
+    out[tier] = resp.choices[0].message.content
+  return out
+worker/render_docx.py
+
+import os, json
+from docx import Document
+
+def render_docx(jobId: str, outputs: dict):
+  doc = Document()
+  doc.add_heading('Summation Pro — Deposition Summary', level=0)
+  for tier, json_text in outputs.items():
+    doc.add_heading(tier.title(), level=1)
+    doc.add_paragraph(json_text)
+  path = f"/mnt/data/{jobId}/summary.docx"
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  doc.save(path)
+  # TODO: upload to results/{jobId}/summary.docx and return SAS URL
+  return f"results://{jobId}/summary.docx"
+worker/status.py
+
+def save_status(jobId: str, status: str, links: dict):
+  # Write to Azure Table (jobs). Copilot to implement.
+  pass
+6) Frontend (React + TS) — Azure Static Web Apps
+Pages: Submit.tsx, Results.tsx, Admin.tsx, Training.tsx.
+frontend/src/lib/api.ts
+
+export async function createSas(name: string) {
+  const r = await fetch(`/api/CreateSas?name=${encodeURIComponent(name)}`);
+  return r.json();
+}
+export async function createJob(body: any) {
+  const r = await fetch('/api/CreateJob', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  return r.json();
+}
+export async function getJob(jobId: string) {
+  const r = await fetch(`/api/GetJob/${jobId}`);
+  return r.json();
+}
+frontend/src/pages/Submit.tsx
+
+import React, { useState } from 'react';
+import { createSas, createJob } from '../lib/api';
+
+export default function Submit() {
+  const [file, setFile] = useState<File|null>(null);
+  const [jobId, setJobId] = useState<string|undefined>();
+  const [useBing, setUseBing] = useState(false);
+
+  async function onSubmit() {
+    if (!file) return;
+    const sas = await createSas(file.name);
+    await fetch(sas.uploadUrl, { method:'PUT', body:file, headers:{'x-ms-blob-type':'BlockBlob'} });
+    const job = await createJob({ blobUrl: sas.blobUrl, tiers: ['partner','associate','paralegal','client','insurance'], useBing });
+    setJobId(job.jobId);
+  }
+
+  return (<div>
+    <h1>Submit Deposition Transcript</h1>
+    <input type="file" accept=".docx,.pdf" onChange={e=>setFile(e.target.files?.[0]||null)} />
+    <label><input type="checkbox" checked={useBing} onChange={e=>setUseBing(e.target.checked)} /> Use Bing grounding (background only)</label>
+    <button onClick={onSubmit} disabled={!file}>Create Job</button>
+    {jobId && <p>Job created: {jobId}</p>}
+  </div>);
+}
+frontend/src/pages/Results.tsx
+
+import React, { useEffect, useState } from 'react';
+import { getJob } from '../lib/api';
+
+export default function Results({ jobId }: { jobId: string }) {
+  const [status, setStatus] = useState<any>({ status: 'Queued' });
+  useEffect(() => {
+    const t = setInterval(async ()=>{
+      const s = await getJob(jobId);
+      setStatus(s);
+    }, 3000);
+    return () => clearInterval(t);
+  }, [jobId]);
+  return (<div>
+    <h1>Results</h1>
+    <pre>{JSON.stringify(status, null, 2)}</pre>
+  </div>);
+}
+frontend/src/pages/Admin.tsx
+
+import React, { useState } from 'react';
+
+export default function Admin(){
+  const [file,setFile] = useState<File|null>(null);
+  async function uploadGuideline(){
+    if (!file) return;
+    const buf = await file.arrayBuffer();
+    await fetch(`/api/AdminUploadGuideline?name=${encodeURIComponent(file.name)}`, {
+      method:'POST', body: buf, headers:{ 'Content-Type': file.type || 'application/octet-stream' }
+    });
+    alert('Uploaded. Reindex will run on next job.');
+  }
+  return (<div>
+    <h1>Admin</h1>
+    <p>Upload/replace guideline docs here (tier rules & process).</p>
+    <input type="file" onChange={e=>setFile(e.target.files?.[0]||null)} />
+    <button onClick={uploadGuideline} disabled={!file}>Upload</button>
+  </div>);
+}
+frontend/src/pages/Training.tsx
+
+export default function Training(){
+  return (<div>
+    <h1>Training</h1>
+    <p>Upload transcript + gold 5-tier summaries to build JSONL; kick off optional fine-tune; run evals.</p>
+  </div>);
+}
+7) Prompt templates (stored in App Configuration)
+Global system (pseudocode)
+
+You are producing a Deposition Transcript Summary (Summation Pro).
+Essential requirements: accuracy, clarity, concision, relevance.
+Never invent facts. Mark unsupported items as Follow-Ups.
+For each factual bullet, include transcript page:line citations.
+Produce all five tiers with their exact page limits & structures.
+The authoritative policy is in the guideline snippets provided (tier rules + process).
+Tier-specific user template
+
+Tier: <partner|associate|paralegal|client|insurance>
+Guideline Snippets:
+- <tier rules from Deposition_summary_guide.docx>
+- <process/essentials from How_to_Summarize.txt>
+
+Evidence:
+- <top-K transcript chunks with page:line metadata>
+
+Return JSON: { "tier": "<name>",
+  "sections": [ { "title": "...", "bullets": ["..."], "cites": ["p:line-p:line", "..."] } ],
+  "followUps": ["..."]
+}
+8) Data formats
+Training JSONL (for optional fine-tune)
+
+{"messages":[
+  {"role":"system","content":"[global directives + tier rules here]"},
+  {"role":"user","content":"[short problem desc + evidence snippets]"}
+], "completion":"[gold Partner outline]"}
+9) Quickstart (hands to Copilot)
+1. Deploy infra with Bicep in /infra (set namePrefix).
+2. Create Azure OpenAI, Document Intelligence, AI Search; record endpoints/keys in App Config/Key Vault.
+3. Build Functions /api; set env vars (storage, SB, search, openai, doc intelligence).
+4. Build worker container image from /worker, push to ACR/GHCR; set image in containerapps-job.bicep; deploy.
+5. Run Static Web Apps with /frontend; wire Entra ID; point to Functions.
+6. Upload two policy docs into Admin (they define style and rules).
+7. Submit a DOCX transcript on Main page; watch job complete; download DOCX.
+Summation Pro — Azure Build Plan (Nick Peligro)
+
+Confidential — Work Product | Hand to GitHub Copilot as source-of-truth
+
